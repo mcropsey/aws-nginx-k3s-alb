@@ -1,0 +1,209 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: mcropsey-lab K3s Cluster with SSH Key Authentication and Sudo Access
+
+Parameters:
+  KeyPairName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: Name of an existing EC2 key pair for SSH access to instances
+    
+  AlmaLinux9AMIId:
+    Type: String
+    Default: ami-0123456789abcdefg # Replace with your AlmaLinux 9 AMI ID
+
+  AdminIPRange:
+    Type: String
+    Default: "192.0.2.0/32" # Replace with your IP for SSH access
+
+Resources:
+
+  # === VPC & Subnets === #
+  mcropsey-lab-VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+
+  mcropsey-lab-SubnetPublicA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref mcropsey-lab-VPC
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs ""]
+
+  mcropsey-lab-SubnetPublicB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref mcropsey-lab-VPC
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone: !Select [1, !GetAZs ""]
+
+  # === Security Groups === #
+  mcropsey-lab-Cluster-SG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: mcropsey-lab-cluster-sg
+      VpcId: !Ref mcropsey-lab-VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 6443
+          ToPort: 6443
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: icmp
+          FromPort: -1
+          ToPort: -1
+          CidrIp: 0.0.0.0/0
+
+      SecurityGroupEgress:
+        - IpProtocol: all
+          CidrIp: 0.0.0.0/0
+
+      Tags:
+        - Key: Project
+          Value: mcropsey-lab-K3s-Cluster
+
+  mcropsey-lab-Nginx-SG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: mcropsey-lab-nginx-sg
+      VpcId: !Ref mcropsey-lab-VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          SourceSecurityGroupName: !Ref mcropsey-lab-Cluster-SG
+
+      Tags:
+        - Key: Project
+          Value: mcropsey-lab-K3s-Cluster
+
+  # === K3s Control Plane === #
+  mcropsey-lab-ControlPlaneInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: t2.medium
+      ImageId: !Ref AlmaLinux9AMIId
+      KeyName: !Ref KeyPairName
+      SubnetId: !Ref mcropsey-lab-SubnetPublicA
+      SecurityGroupIds:
+        - !GetAtt mcropsey-lab-Cluster-SG.GroupId
+
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash -xe
+          yum install -y aws-cfn-bootstrap
+          /opt/aws/bin/cfn-init -v \
+            --stack ${AWS::StackName} \
+            --resource mcropsey-lab-ControlPlaneInstance \
+            --region ${AWS::Region}
+      Tags:
+        - Key: Project
+          Value: mcropsey-lab-K3s-Cluster
+
+    Metadata:
+      AWS::CloudFormation::Init:
+        config:
+          files:
+            /etc/sudoers.d/mcropsey:
+              content: |
+                # Created by CloudFormation template
+                mcropsey ALL=(ALL) NOPASSWD: ALL
+              mode: "0440"
+              owner: root
+              group: root
+
+          commands:
+            01_create_user:
+              command: useradd -m -s /bin/bash mcropsey
+            02_setup_ssh_dir:
+              command: install -d -m 700 -o mcropsey -g mcropsey /home/mcropsey/.ssh
+            03_copy_authorized_keys:
+              command: cp /home/ec2-user/.ssh/authorized_keys /home/mcropsey/.ssh/authorized_keys && chown mcropsey:mcropsey /home/mcropsey/.ssh/authorized_keys && chmod 600 /home/mcropsey/.ssh/authorized_keys
+            04_disable_firewalld:
+              command: systemctl stop firewalld && systemctl disable firewalld
+            05_disable_selinux:
+              command: sed -i 's/SELINUX=enforcing/SELINUX=permissive/' /etc/selinux/config
+
+          services:
+            sysvinit:
+              nginx:
+                enabled: false  # Prevent conflicts if Nginx is installed later
+    DependsOn: mcropsey-lab-Cluster-SG
+
+  # === Nginx Ingress === #
+  mcropsey-lab-NginxInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: t2.small
+      ImageId: !Ref AlmaLinux9AMIId
+      KeyName: !Ref KeyPairName
+      SubnetId: !Ref mcropsey-lab-SubnetPublicA
+      SecurityGroupIds:
+        - !GetAtt mcropsey-lab-Nginx-SG.GroupId
+
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash -xe
+          yum install -y aws-cfn-bootstrap
+          /opt/aws/bin/cfn-init -v \
+            --stack ${AWS::StackName} \
+            --resource mcropsey-lab-NginxInstance \
+            --region ${AWS::Region}
+      Tags:
+        - Key: Project
+          Value: mcropsey-lab-K3s-Cluster
+
+    Metadata:
+      AWS::CloudFormation::Init:
+        config:
+          packages:
+            yum:
+              nginx: []
+          files:
+            /etc/sudoers.d/mcropsey:
+              content: |
+                # Created by CloudFormation template
+                mcropsey ALL=(ALL) NOPASSWD: ALL
+              mode: "0440"
+              owner: root
+              group: root
+
+            /etc/nginx/conf.d/default.conf:
+              content: |
+                server {
+                    listen 80;
+                    location / {
+                        proxy_pass https://<ALB-DNS>:443;
+                        proxy_ssl_verify off;
+                    }
+                }
+
+          commands:
+            01_create_user:
+              command: useradd -m -s /bin/bash mcropsey
+            02_setup_ssh_dir:
+              command: install -d -m 700 -o mcropsey -g mcropsey /home/mcropsey/.ssh
+            03_copy_authorized_keys:
+              command: cp /home/ec2-user/.ssh/authorized_keys /home/mcropsey/.ssh/authorized_keys && chown mcropsey:mcropsey /home/mcropsey/.ssh/authorized_keys && chmod 600 /home/mcropsey/.ssh/authorized_keys
+            04_disable_firewalld:
+              command: systemctl stop firewalld && systemctl disable firewalld
+            05_disable_selinux:
+              command: sed -i 's/SELINUX=enforcing/SELINUX=permissive/' /etc/selinux/config
+            06_enable_nginx:
+              command: systemctl enable --now nginx
+
+    DependsOn: mcropsey-lab-Nginx-SG
+
+  # === Outputs === #
+Outputs:
+  NginxPublicIP:
+    Description: Public IP of the Nginx Ingress server (mcropsey-lab-nginx-instance)
+    Value: !GetAtt mcropsey-lab-NginxInstance.PublicIp
